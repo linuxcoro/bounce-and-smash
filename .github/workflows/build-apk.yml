@@ -1,0 +1,167 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Android debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar Godot, Android SDK y keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          godot --version
+          VER_MM="$(godot --version 2>/dev/null | cut -d. -f1,2)"
+          if [ -z "$VER_MM" ]; then VER_MM="4.3"; fi
+          echo "Godot ${VER_MM}: usando editor_settings-${VER_MM}.tres"
+          mkdir -p "$HOME/.config/godot" "$HOME/.local/share/godot/export_templates"
+          # EditorSettings y export templates que dejó la imagen en /root.
+          if [ -d /root/.config/godot ]; then
+            cp -R /root/.config/godot/. "$HOME/.config/godot/"
+          fi
+          if [ -d /root/.local/share/godot/export_templates ]; then
+            cp -R /root/.local/share/godot/export_templates/. "$HOME/.local/share/godot/export_templates/"
+          fi
+          # EditorSettings deterministas: SDK, JDK y keystore debug del contenedor.
+          # Se escriben ambos nombres de archivo (4.3+ y 4.2) para no depender de la versión.
+          for S in "$HOME/.config/godot/editor_settings-${VER_MM}.tres" "$HOME/.config/godot/editor_settings-4.tres"; do
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\n' > "$S"
+            printf 'export/android/java_sdk_path = "/usr/lib/jvm/java-17-openjdk-amd64"\n' >> "$S"
+            printf 'export/android/android_sdk_path = "/usr/lib/android-sdk"\n' >> "$S"
+            printf 'export/android/debug_keystore = "/root/debug.keystore"\n' >> "$S"
+            printf 'export/android/debug_keystore_user = "androiddebugkey"\n' >> "$S"
+            printf 'export/android/debug_keystore_pass = "android"\n' >> "$S"
+            printf 'export/android/force_system_user = false\n' >> "$S"
+          done
+          echo "--- plantillas de exportación ---"
+          find "$HOME/.local/share/godot/export_templates" -maxdepth 3 \( -name 'android_*.apk' -o -name 'android_source.zip' \) -print || true
+          echo "--- build-tools ---"
+          ls /usr/lib/android-sdk/build-tools || true
+          echo "--- keystore ---"
+          ls -l /root/debug.keystore || true
+          echo "--- editor settings ---"
+          grep -H android "$HOME/.config/godot/"*.tres || true
+
+      - name: Importar recursos (opcional)
+        continue-on-error: true
+        shell: bash
+        run: godot --headless --path "$GITHUB_WORKSPACE" --editor --quit
+
+      - name: Exportar APK debug
+        id: export
+        shell: bash
+        run: |
+          mkdir -p build
+          set +e
+          godot --headless --verbose --path "$GITHUB_WORKSPACE" --export-debug "Android Debug" "$GITHUB_WORKSPACE/build/bounce-and-smash.apk" > build/export.log 2>&1
+          status=$?
+          cat build/export.log
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "godot=$(godot --version 2>&1 | head -1)"
+              echo "templates=$(find "$HOME/.local/share/godot/export_templates" -maxdepth 2 -name 'android_debug.apk' 2>/dev/null | tr '\n' ' ')"
+              echo "build_tools=$(ls /usr/lib/android-sdk/build-tools 2>/dev/null | tr '\n' ' ')"
+              echo "settings=$(grep -h 'android_sdk_path' "$HOME/.config/godot/"*.tres 2>/dev/null | tr '\n' ' ')"
+              echo "--- contexto del error ---"
+              LINE=$(grep -an "Cannot export project" build/export.log | tail -1 | cut -d: -f1)
+              if [ -n "$LINE" ]; then
+                START=$((LINE - 3))
+                if [ "$START" -lt 1 ]; then START=1; fi
+                sed -n "${START},$((LINE + 20))p" build/export.log
+              fi
+              echo "--- lineas con error ---"
+              grep -aiE "error|failed|missing|invalid|not found|cannot|unable|not installed|no export|keystore|sdk|parse" build/export.log | tail -n 25
+              echo "--- cola del log ---"
+              tail -n 25 build/export.log
+            } > build/diag.txt
+            MSG=$(cut -c1-1000 build/diag.txt | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/$/%0A/' | tr -d '\n')
+            echo "::error::$MSG"
+            exit "$status"
+          fi
+
+      - name: Subir log del export si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-log
+          path: build/export.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Verificar APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh build
+          test -s build/bounce-and-smash.apk
+          if [ -x /usr/lib/android-sdk/build-tools/33.0.2/aapt ]; then
+            /usr/lib/android-sdk/build-tools/33.0.2/aapt dump badging build/bounce-and-smash.apk | head -6 || true
+          fi
+
+      - name: Publicar artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounce-and-smash-apk
+          path: build/bounce-and-smash.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Smoke test de la lógica
+        shell: bash
+        run: godot --headless --path "$GITHUB_WORKSPACE" --script res://tests/smoke.gd
+
+  release:
+    name: Release con el APK
+    needs: apk
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Descargar el APK compilado
+        uses: actions/download-artifact@v4
+        with:
+          name: bounce-and-smash-apk
+          path: dist
+
+      - name: Comprobar el APK
+        shell: bash
+        run: |
+          ls -lh dist
+          test -s dist/bounce-and-smash.apk
+
+      - name: Crear o actualizar el Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          NOTES="APK de Bounce & Smash compilada en GitHub Actions. Firmada en modo debug: se instala activando 'orígenes desconocidos'; no es un APK de Play Store."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/bounce-and-smash.apk --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/bounce-and-smash.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Bounce & Smash $TAG" \
+              --notes "$NOTES" \
+              --latest
+          fi

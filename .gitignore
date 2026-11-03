@@ -1,0 +1,15 @@
+# Godot
+.godot/
+.godot/imported/
+build/
+export.cfg
+export_credentials.cfg
+
+# Artefactos locales
+*.apk
+*.aab
+*.tmp
+
+# Sistema
+.DS_Store
+Thumbs.db
